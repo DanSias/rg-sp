@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>RocketGate × Shoplazza App</title>
+<h1>🚀 RocketGate × Shoplazza App</h1>
+<p>Start the OAuth install for your store.</p>
+<form action="/auth/start" method="get" style="margin-bottom:1rem">
+  <label>Shop domain:
+    <input type="text" name="shop" placeholder="your-store.myshoplazza.com" required
+           pattern="^[a-z0-9][a-z0-9-]*\.(myshoplazza|myshoplaza)\.com$"
+           style="min-width:320px" />
+  </label>
+  <button type="submit">Start OAuth</button>
+</form>
+<p><a href="/health">Health</a></p>
