@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Installed · RocketGate × Shoplazza</title>
+<h1>✅ Installed</h1>
+<p>Shop: <strong id="shop">unknown</strong></p>
+<p>You're connected. Next: test webhooks and payment init.</p>
+<p><a href="/">Back home</a></p>
+<script>
+  const p = new URLSearchParams(location.search);
+  document.getElementById('shop').textContent = p.get('shop') || 'unknown';
+</script>
