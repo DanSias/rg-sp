@@ -1,9 +1,7 @@
 // src/db/index.js
 // Single import/export hub for all DB access.
-// Uses a shared better-sqlite3 connection so every module
-// (shops, payments, orders) runs on the same file/transaction context.
 
-export { db } from './connection.js';
+export { db, runMigrations } from './connection.js';
 
 // Shops (SQLite)
 export { upsertShop, getShop, listShops, resetShops } from './shops.js';
