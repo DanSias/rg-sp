@@ -25,7 +25,7 @@ describe('callbacks', () => {
     process.env.ROCKETGATE_MERCHANT_ID = '1483462469';
     process.env.ROCKETGATE_HASH_SECRET = 'test_hash_secret';
     process.env.ROCKETGATE_ENV = 'dev-secure';
-    process.env.PUBLIC_BASE_URL = 'https://example.test';
+    process.env.APP_BASE_URL = 'https://example.test';
   });
 
   afterEach(() => {

@@ -24,7 +24,7 @@ describe('/pay/init', () => {
     delete process.env.ROCKETGATE_HOSTED_BASE_URL;
     delete process.env.ROCKETGATE_HOSTED_PATH;
 
-    process.env.PUBLIC_BASE_URL = 'https://example.test';
+    process.env.APP_BASE_URL = 'https://example.test';
     process.env.PORT = '3000';
   });
 

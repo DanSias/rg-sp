@@ -114,7 +114,7 @@ router.get('/init', verifyProxySignature, (req, res) => {
   }
 
   // Build return URLs and Hosted Page URL
-  const host = process.env.PUBLIC_BASE_URL || 'http://localhost:3000';
+  const host = process.env.APP_BASE_URL || 'http://localhost:3000';
   const success = `${host}/callbacks/complete-payment?orderId=${encodeURIComponent(orderId)}&status=success`;
   const fail = `${host}/callbacks/complete-payment?orderId=${encodeURIComponent(orderId)}&status=fail`;
 

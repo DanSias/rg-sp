@@ -20,11 +20,11 @@ function normalizeMajorAmountStr(v) {
 }
 
 /**
- * Build absolute callback URLs from PUBLIC_BASE_URL (defensive: trim trailing slash).
+ * Build absolute callback URLs from APP_BASE_URL (defensive: trim trailing slash).
  */
 function buildReturnUrls(orderId) {
   const base =
-    (process.env.PUBLIC_BASE_URL && process.env.PUBLIC_BASE_URL.replace(/\/+$/, '')) ||
+    (process.env.APP_BASE_URL && process.env.APP_BASE_URL.replace(/\/+$/, '')) ||
     `http://localhost:${process.env.PORT || 3000}`;
 
   // Use "result" to match the callbacks implementation we outlined
