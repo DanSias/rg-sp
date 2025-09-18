@@ -1,14 +1,74 @@
 <!doctype html>
 <meta charset="utf-8" />
 <title>RocketGate × Shoplazza App</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    margin: 2rem auto;
+    max-width: 600px;
+    line-height: 1.5;
+  }
+  h1 {
+    font-size: 1.8rem;
+  }
+  form {
+    margin: 1.5rem 0;
+  }
+  label {
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+  input[type="text"] {
+    padding: 0.4rem;
+    font-size: 1rem;
+  }
+  button {
+    margin-top: 0.75rem;
+    padding: 0.5rem 1rem;
+    font-size: 1rem;
+    cursor: pointer;
+  }
+  .note {
+    font-size: 0.9rem;
+    color: #555;
+  }
+</style>
+
 <h1>🚀 RocketGate × Shoplazza App</h1>
-<p>Start the OAuth install for your store.</p>
-<form action="/auth/start" method="get" style="margin-bottom:1rem">
-  <label>Shop domain:
-    <input type="text" name="shop" placeholder="your-store.myshoplazza.com" required
-           pattern="^[a-z0-9][a-z0-9-]*\.(myshoplazza|myshoplaza)\.com$"
-           style="min-width:320px" />
-  </label>
-  <button type="submit">Start OAuth</button>
+<p>
+  This app connects your <strong>Shoplazza store</strong> with 
+  <strong>RocketGate Payments</strong>, enabling secure checkout and 
+  streamlined transaction processing.
+</p>
+
+<h2>Install the App</h2>
+<p>
+  Enter your Shoplazza store domain below to begin the secure OAuth 
+  installation process.
+</p>
+
+<form action="/auth/start" method="get">
+  <label for="shop">Shop domain:</label>
+  <input
+    id="shop"
+    type="text"
+    name="shop"
+    placeholder="your-store.myshoplazza.com"
+    required
+    pattern="^[a-z0-9][a-z0-9-]*\.(myshoplazza|myshoplaza)\.com$"
+    style="min-width: 320px"
+  />
+  <br />
+  <button type="submit">Authorize RocketGate</button>
 </form>
-<p><a href="/health">Health</a></p>
+
+<p class="note">
+  Example: <code>rg-demo.myshoplazza.com</code>
+</p>
+
+<hr />
+
+<p>
+  Developer tools: 
+  <a href="/health">Health Check</a>
+</p>
