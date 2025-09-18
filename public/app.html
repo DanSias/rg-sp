@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>RocketGate × Shoplazza · Dashboard</title>
+<link rel="stylesheet" href="/dist/styles.css" />
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 760px; line-height: 1.5; }
+  .card { border:1px solid #e5e7eb; border-radius:12px; padding:1rem; margin:1rem 0; }
+  label { display:block; margin:.5rem 0 .25rem; font-weight:600; }
+  input, select { padding:.45rem .5rem; width: 100%; max-width: 420px; }
+  button { padding:.5rem .9rem; cursor:pointer; }
+  .row { display:flex; gap:1rem; flex-wrap:wrap; }
+  .muted { color:#6b7280; font-size:.9rem; }
+  code { background:#f3f4f6; padding:.12rem .32rem; border-radius:6px; }
+</style>
+
+<h1>🚀 RocketGate × Shoplazza</h1>
+<p class="muted">Connected store: <strong id="shop">unknown</strong></p>
+
+<section class="card">
+  <h2>RocketGate Settings</h2>
+  <form id="rgSettings">
+    <input type="hidden" name="shop" id="shopField" />
+    <label for="merchantId">Merchant ID</label>
+    <input id="merchantId" name="merchantId" placeholder="e.g. 100000000123" />
+    <label for="merchantPassword">Merchant Password / Key</label>
+    <input id="merchantPassword" name="merchantPassword" placeholder="••••••••" />
+    <label for="mode">Mode</label>
+    <select id="mode" name="mode">
+      <option value="test">Test</option>
+      <option value="live">Live</option>
+    </select>
+    <label for="returnUrl">Return URL</label>
+    <input id="returnUrl" name="returnUrl" />
+    <label for="cancelUrl">Cancel URL</label>
+    <input id="cancelUrl" name="cancelUrl" />
+    <div style="margin-top:1rem"><button type="submit">Save Settings</button></div>
+  </form>
+  <div id="saveMsg" class="muted" style="margin-top:.5rem"></div>
+</section>
+
+<section class="card">
+  <h2>Hosted Page — Test</h2>
+  <form id="hpTest">
+    <input type="hidden" name="shop" id="shopField2" />
+    <div class="row">
+      <div>
+        <label for="amount">Amount</label>
+        <input id="amount" name="amount" value="19.99" />
+      </div>
+      <div>
+        <label for="currency">Currency</label>
+        <input id="currency" name="currency" value="USD" />
+      </div>
+      <div style="align-self:flex-end">
+        <button type="submit">Generate Hosted Page Link</button>
+      </div>
+    </div>
+  </form>
+  <p class="muted" id="hpResult"></p>
+</section>
+
+<section class="card">
+  <h2>Tools</h2>
+  <div class="row">
+    <a href="/health">Health</a>
+    <a id="logsLink" href="/admin/logs">Logs</a>
+    <a id="shopsLink" href="/admin/shops">Shops</a>
+  </div>
+</section>
+
+<script>
+  const p = new URLSearchParams(location.search);
+  const shop = p.get('shop') || '';
+  const adminToken = (p.get('token') || '');
+
+  document.getElementById('shop').textContent = shop || 'unknown';
+  document.getElementById('shopField').value = shop;
+  document.getElementById('shopField2').value = shop;
+
+  const base = location.origin;
+  document.getElementById('returnUrl').value = base + '/rg/return';
+  document.getElementById('cancelUrl').value = base + '/rg/cancel';
+
+  if (adminToken) {
+    document.getElementById('logsLink').href += '?token=' + encodeURIComponent(adminToken);
+    document.getElementById('shopsLink').href += '?token=' + encodeURIComponent(adminToken);
+  }
+
+  document.getElementById('rgSettings').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target).entries());
+    const resp = await fetch('/api/rg-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const json = await resp.json();
+    document.getElementById('saveMsg').textContent = json.ok ? 'Saved.' : ('Error: ' + (json.error || 'unknown'));
+  });
+
+  document.getElementById('hpTest').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target).entries());
+    const resp = await fetch('/api/test-hosted-page', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const json = await resp.json();
+    const el = document.getElementById('hpResult');
+    if (json.ok && json.url) {
+      el.innerHTML = 'Hosted Page URL: <a target="_blank" rel="noopener" href="' +
+        json.url + '">Open</a>';
+    } else {
+      el.textContent = 'Error: ' + (json.error || 'unknown');
+    }
+  });
+</script>

@@ -58,3 +58,47 @@ export function maybeVerifyShoplazzaSignature(req, res, next) {
       .json({ error: { code: 'SIGNATURE_VERIFY_ERROR', message: err.message } });
   }
 }
+
+/**
+ * Verify Shoplazza embedded-launch HMAC on the query string.
+ * - Expects `hmac` param (hex) and sorts the remaining keys lexicographically.
+ * - Compares in constant time.
+ */
+export function verifyLaunchHmac(query, clientSecret) {
+  if (!query || !clientSecret) return { ok: false, reason: 'missing' };
+
+  const provided = String(query.hmac || '');
+  if (!provided) return { ok: false, reason: 'no_hmac' };
+
+  // Build canonical string: key=value joined by '&', excluding 'hmac'
+  const pairs = Object.keys(query)
+    .filter((k) => k !== 'hmac')
+    .sort()
+    .map((k) => {
+      const v = query[k];
+      const val = Array.isArray(v) ? v.join(',') : String(v);
+      return `${k}=${val}`;
+    })
+    .join('&');
+
+  const calc = crypto.createHmac('sha256', clientSecret).update(pairs).digest('hex');
+
+  const A = Buffer.from(calc, 'utf8');
+  const B = Buffer.from(provided.toLowerCase(), 'utf8');
+  const ok = A.length === B.length && crypto.timingSafeEqual(A, B);
+  return ok ? { ok: true } : { ok: false, reason: 'mismatch' };
+}
+
+export function verifyShoplazzaHmac(query, clientSecret) {
+  if (!query.hmac) return false;
+
+  const { hmac, ...rest } = query;
+  const sorted = Object.keys(rest)
+    .sort()
+    .map((k) => `${k}=${rest[k]}`)
+    .join('&');
+
+  const digest = crypto.createHmac('sha256', clientSecret).update(sorted).digest('hex');
+
+  return digest === hmac;
+}
