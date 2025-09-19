@@ -1,126 +1,117 @@
 // src/db/orders.js
-/**
- * SQLite-backed orders store used by /order routes.
- * API:
- *   - createOrder({ orderId, amount, currency, customer })
- *   - getOrder(orderId)
- *   - listOrders()
- *   - updateOrder(orderId, { status?, rocketgateTxnId? })
- *   - resetOrders()
- */
+// Kysely-based orders store.
+// API:
+//   - createOrder({ orderId, amount, currency, customer })
+//   - getOrder(orderId)
+//   - listOrders()
+//   - updateOrder(orderId, { status?, rocketgateTxnId? })
+//   - resetOrders()
+
+import { sql } from 'kysely';
+
 import { db } from './connection.js';
 
-// Schema
-db.exec(`
-  CREATE TABLE IF NOT EXISTS orders (
-    order_id        TEXT PRIMARY KEY,
-    amount          TEXT,
-    currency        TEXT,
-    customer_json   TEXT,
-    status          TEXT,
-    rocketgate_txn  TEXT,
-    created_at      INTEGER,
-    updated_at      INTEGER
-  );
-`);
+const DB_CLIENT = (process.env.DB_CLIENT || 'sqlite').toLowerCase();
+const isPg = DB_CLIENT === 'postgres';
+const isMy = DB_CLIENT === 'mysql';
 
-const selOne = db.prepare(`
-  SELECT
-    order_id        AS orderId,
-    amount,
-    currency,
-    customer_json   AS customerJson,
-    status,
-    rocketgate_txn  AS rocketgateTxnId,
-    created_at      AS createdAtMs,
-    updated_at      AS updatedAtMs
-  FROM orders
-  WHERE order_id = ?
-`);
+// --- Minimal, idempotent schema bootstrap (safe to keep until we add it to runMigrations) ---
+await db.schema
+  .createTable('orders')
+  .ifNotExists()
+  .addColumn('order_id', 'varchar(191)', (col) => col.primaryKey())
+  .addColumn('amount', isMy ? 'decimal(18,2)' : isPg ? 'numeric' : 'real')
+  .addColumn('currency', 'varchar(8)')
+  .addColumn('customer_json', 'text')
+  .addColumn('status', 'varchar(64)') // e.g., pending | paid | refunded | voided | ...
+  .addColumn('rocketgate_txn', 'varchar(191)')
+  .addColumn('created_at', isPg ? 'timestamptz' : 'text', (col) =>
+    col.defaultTo(sql`CURRENT_TIMESTAMP`)
+  )
+  .addColumn('updated_at', isPg ? 'timestamptz' : 'text', (col) =>
+    col.defaultTo(sql`CURRENT_TIMESTAMP`)
+  )
+  .execute();
 
-const selAll = db.prepare(`
-  SELECT
-    order_id        AS orderId,
-    amount,
-    currency,
-    customer_json   AS customerJson,
-    status,
-    rocketgate_txn  AS rocketgateTxnId,
-    created_at      AS createdAtMs,
-    updated_at      AS updatedAtMs
-  FROM orders
-  ORDER BY created_at DESC
-`);
-
-const insert = db.prepare(`
-  INSERT INTO orders (order_id, amount, currency, customer_json, status, rocketgate_txn, created_at, updated_at)
-  VALUES (@orderId, @amount, @currency, @customerJson, @status, @rocketgateTxnId, @createdAtMs, @updatedAtMs)
-`);
-
-const updateStmt = db.prepare(`
-  UPDATE orders
-  SET status = COALESCE(@status, status),
-      rocketgate_txn = COALESCE(@rocketgateTxnId, rocketgate_txn),
-      updated_at = @updatedAtMs
-  WHERE order_id = @orderId
-`);
-
-const delAll = db.prepare(`DELETE FROM orders`);
-
+// --- Row ↔ public model helpers ---
 function rowToPublic(row) {
   if (!row) return null;
   return {
-    orderId: row.orderId,
-    amount: row.amount,
-    currency: row.currency,
-    customer: row.customerJson ? JSON.parse(row.customerJson) : null,
-    status: row.status,
-    rocketgateTxnId: row.rocketgateTxnId ?? null,
-    createdAt: new Date(row.createdAtMs).toISOString(),
-    updatedAt: row.updatedAtMs ? new Date(row.updatedAtMs).toISOString() : null,
+    orderId: row.order_id,
+    amount:
+      row.amount == null
+        ? null
+        : // keep amount as string to avoid float surprises across dialects
+          String(row.amount),
+    currency: row.currency || null,
+    customer: row.customer_json ? safeParse(row.customer_json) : null,
+    status: row.status || null,
+    rocketgateTxnId: row.rocketgate_txn || null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
   };
 }
 
-export function createOrder({ orderId, amount, currency, customer }) {
-  if (!orderId || !amount || !currency) {
-    throw new Error('createOrder: orderId, amount, currency are required');
+function safeParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
   }
-  const now = Date.now();
-  insert.run({
-    orderId,
-    amount: String(amount),
-    currency: String(currency).toUpperCase(),
-    customerJson: customer ? JSON.stringify(customer) : null,
-    status: 'pending',
-    rocketgateTxnId: null,
-    createdAtMs: now,
-    updatedAtMs: null,
-  });
-  return getOrder(orderId);
 }
 
-export function getOrder(orderId) {
-  const row = selOne.get(orderId);
+// --- Public API ---
+
+export async function createOrder({ orderId, amount, currency, customer }) {
+  if (!orderId || amount == null || !currency) {
+    throw new Error('createOrder: orderId, amount, currency are required');
+  }
+
+  const toInsert = {
+    order_id: String(orderId),
+    amount: typeof amount === 'number' ? amount : String(amount),
+    currency: String(currency).toUpperCase(),
+    customer_json: customer ? JSON.stringify(customer) : null,
+    status: 'pending',
+    rocketgate_txn: null,
+  };
+
+  await db.insertInto('orders').values(toInsert).execute();
+
+  return await getOrder(orderId);
+}
+
+export async function getOrder(orderId) {
+  const row = await db
+    .selectFrom('orders')
+    .selectAll()
+    .where('order_id', '=', String(orderId))
+    .executeTakeFirst();
+
   return rowToPublic(row);
 }
 
-export function listOrders() {
-  return selAll.all().map(rowToPublic);
+export async function listOrders() {
+  const rows = await db.selectFrom('orders').selectAll().orderBy('created_at', 'desc').execute();
+
+  return rows.map(rowToPublic);
 }
 
-export function updateOrder(orderId, { status, rocketgateTxnId } = {}) {
-  const now = Date.now();
-  updateStmt.run({
-    orderId,
-    status: status ?? null,
-    rocketgateTxnId: rocketgateTxnId ?? null,
-    updatedAtMs: now,
-  });
-  return getOrder(orderId);
+export async function updateOrder(orderId, { status, rocketgateTxnId } = {}) {
+  const patch = {
+    ...(status != null ? { status } : {}),
+    ...(rocketgateTxnId != null ? { rocketgate_txn: rocketgateTxnId } : {}),
+    updated_at: sql`CURRENT_TIMESTAMP`,
+  };
+
+  await db.updateTable('orders').set(patch).where('order_id', '=', String(orderId)).execute();
+
+  return await getOrder(orderId);
 }
 
-export function resetOrders() {
-  delAll.run();
+export async function resetOrders() {
+  // Use truncate for pg/mysql later; delete is fine here and portable.
+  await db.deleteFrom('orders').execute();
 }
 
 export default { createOrder, getOrder, listOrders, updateOrder, resetOrders };

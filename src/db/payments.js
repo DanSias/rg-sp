@@ -1,78 +1,43 @@
 // src/db/payments.js
 /**
- * SQLite-backed payments store.
+ * Kysely-backed payments store.
+ * Table: payments (created by runMigrations in src/db/connection.js)
+ *
+ * Columns (see connection.js):
+ *   id, shop_domain, order_id, payment_id, customer_id,
+ *   amount, currency, status, rocketgate_txn,
+ *   status_history (text JSON), rg_raw_notify (text), spz_raw_complete (text),
+ *   created_at, updated_at
+ *
  * API:
- *   - createOrUpdatePayment({ orderId, customerId?, amount?, currency?, status? })
- *   - getPayment(orderId)
- *   - setPaymentStatus({ orderId, status, rocketgateTxnId? }) // forward-only transitions
+ *   - createOrUpdatePayment({ shopDomain, orderId, paymentId?, customerId?, amount?, currency?, status?, rocketgateTxnId?, appendHistory? })
+ *   - getPayment(orderId)                       // by Shoplazza order id (legacy-friendly)
+ *   - getPaymentByPaymentId(paymentId)          // by Shoplazza payment attempt id
+ *   - setPaymentStatus({ orderId, status, rocketgateTxnId?, appendHistory? })
  *   - resetPayments()
  *
  * Notes:
  * - Status is "forward-only" via rank precedence to avoid accidental downgrades.
+ * - Status history is stored as a JSON array in `status_history`.
  */
+
+import { sql } from 'kysely';
+
 import { db } from './connection.js';
 
-// Schema
-db.exec(`
-  CREATE TABLE IF NOT EXISTS payments (
-    order_id        TEXT PRIMARY KEY,
-    customer_id     TEXT,
-    amount          TEXT,
-    currency        TEXT,
-    rocketgate_txn  TEXT,
-    status          TEXT,
-    last_update     INTEGER
-  );
-`);
+// -------------------------- Forward-only rank ---------------------------
 
-const selOne = db.prepare(`
-  SELECT
-    order_id        AS order_id,
-    customer_id     AS customer_id,
-    amount          AS amount,
-    currency        AS currency,
-    rocketgate_txn  AS rocketgate_txn,
-    status          AS status,
-    last_update     AS last_update
-  FROM payments
-  WHERE order_id = ?
-`);
-
-const upsert = db.prepare(`
-  INSERT INTO payments (order_id, customer_id, amount, currency, rocketgate_txn, status, last_update)
-  VALUES (@order_id, @customer_id, @amount, @currency, @rocketgate_txn, @status, @last_update)
-  ON CONFLICT(order_id) DO UPDATE SET
-    customer_id    = COALESCE(excluded.customer_id, payments.customer_id),
-    amount         = COALESCE(excluded.amount,      payments.amount),
-    currency       = COALESCE(excluded.currency,    payments.currency),
-    rocketgate_txn = COALESCE(excluded.rocketgate_txn, payments.rocketgate_txn),
-    status         = COALESCE(excluded.status,      payments.status),
-    last_update    = excluded.last_update
-`);
-
-const updateMinimal = db.prepare(`
-  UPDATE payments
-  SET status = @status,
-      rocketgate_txn = COALESCE(@rocketgate_txn, rocketgate_txn),
-      last_update = @last_update
-  WHERE order_id = @order_id
-`);
-
-const delAll = db.prepare(`DELETE FROM payments`);
-
-export function getPayment(orderId) {
-  return selOne.get(orderId) ?? null;
-}
-
-// rank: forward-only transitions
 const RANK = new Map([
-  ['pending', 0],
-  ['returned_fail', 1],
-  ['returned_success', 2],
-  ['paid', 3],
-  ['refunded', 4],
-  ['voided', 5],
-  ['chargeback', 6],
+  ['initiated', 0],
+  ['pending', 1],
+  ['returned_fail', 2],
+  ['returned_success', 3],
+  ['paid', 4],
+  ['refunded', 5],
+  ['voided', 6],
+  ['chargeback', 7],
+  ['error', 8],
+  ['declined', 9],
 ]);
 
 function canAdvance(oldStatus, newStatus) {
@@ -82,47 +47,151 @@ function canAdvance(oldStatus, newStatus) {
   return newR >= oldR;
 }
 
+function nowIso() {
+  // Use ISO for history entries; updated_at uses DB CURRENT_TIMESTAMP
+  return new Date().toISOString();
+}
+
+/**
+ * Internal: append a history entry to an existing JSON array (stored as TEXT).
+ */
+function appendHistoryText(prevText, entry) {
+  try {
+    const arr = prevText ? JSON.parse(prevText) : [];
+    arr.push(entry);
+    return JSON.stringify(arr);
+  } catch {
+    // If existing is malformed, start fresh with current entry.
+    return JSON.stringify([entry]);
+  }
+}
+
+// ------------------------------ Reads ----------------------------------
+
+export async function getPayment(orderId) {
+  if (!orderId) return null;
+  const row = await db
+    .selectFrom('payments')
+    .selectAll()
+    .where('order_id', '=', String(orderId))
+    .executeTakeFirst();
+  return row ?? null;
+}
+
+export async function getPaymentByPaymentId(paymentId) {
+  if (!paymentId) return null;
+  const row = await db
+    .selectFrom('payments')
+    .selectAll()
+    .where('payment_id', '=', String(paymentId))
+    .executeTakeFirst();
+  return row ?? null;
+}
+
+// ------------------------------ Upserts --------------------------------
+
 /**
  * Upsert/merge a payment row. Ignores status if it would downgrade.
+ * Accepts both the “new” shape and the older one (for current callers).
  */
-export function createOrUpdatePayment({
+export async function createOrUpdatePayment({
+  shopDomain = null,
   orderId,
+  paymentId = null,
   customerId = null,
   amount = null,
   currency = null,
   status = null,
   rocketgateTxnId = null,
-}) {
+  appendHistory = true,
+} = {}) {
   if (!orderId) throw new Error('createOrUpdatePayment: orderId is required');
 
-  const prev = getPayment(orderId);
+  const prev = await getPayment(orderId);
+
   const nextStatus =
     status && canAdvance(prev?.status, status) ? status : (prev?.status ?? status ?? 'pending');
 
-  const row = {
-    order_id: orderId,
+  const historyEntry = { ts: nowIso(), status: nextStatus, source: 'createOrUpdate' };
+  const status_history = appendHistory
+    ? appendHistoryText(prev?.status_history ?? null, historyEntry)
+    : (prev?.status_history ?? null);
+
+  // Build write set
+  const toWrite = {
+    shop_domain: shopDomain ?? prev?.shop_domain ?? null,
+    order_id: String(orderId),
+    payment_id: paymentId ?? prev?.payment_id ?? null,
     customer_id: customerId ?? prev?.customer_id ?? null,
     amount: amount ?? prev?.amount ?? null,
     currency: currency ?? prev?.currency ?? null,
+    status: nextStatus,
     rocketgate_txn: rocketgateTxnId ?? prev?.rocketgate_txn ?? null,
-    status: nextStatus ?? null,
-    last_update: Date.now(),
+    status_history,
   };
 
-  upsert.run(row);
-  return getPayment(orderId);
+  // Upsert keyed by (shop_domain, order_id, payment_id) if present; otherwise by order_id as fallback
+  // We’ll use the unique constraint from migrations (shop_domain, order_id, payment_id).
+  // If payment_id is null, uniqueness falls back effectively to (shop_domain, order_id).
+  await db
+    .insertInto('payments')
+    .values(toWrite)
+    .onConflict((oc) =>
+      oc.columns(['shop_domain', 'order_id', 'payment_id']).doUpdateSet((eb) => ({
+        shop_domain: eb.ref('excluded.shop_domain'),
+        customer_id: eb
+          .case()
+          .when(sql`excluded.customer_id IS NOT NULL`)
+          .then(eb.ref('excluded.customer_id'))
+          .else(eb.ref('payments.customer_id'))
+          .end(),
+        amount: eb
+          .case()
+          .when(sql`excluded.amount IS NOT NULL`)
+          .then(eb.ref('excluded.amount'))
+          .else(eb.ref('payments.amount'))
+          .end(),
+        currency: eb
+          .case()
+          .when(sql`excluded.currency IS NOT NULL`)
+          .then(eb.ref('excluded.currency'))
+          .else(eb.ref('payments.currency'))
+          .end(),
+        rocketgate_txn: eb
+          .case()
+          .when(sql`excluded.rocketgate_txn IS NOT NULL`)
+          .then(eb.ref('excluded.rocketgate_txn'))
+          .else(eb.ref('payments.rocketgate_txn'))
+          .end(),
+        // Forward-only for status
+        status: sql`CASE
+                        WHEN ${nextStatus} IS NOT NULL THEN ${nextStatus}
+                        ELSE payments.status
+                      END`,
+        status_history: toWrite.status_history ?? eb.ref('payments.status_history'),
+        updated_at: sql`CURRENT_TIMESTAMP`,
+      }))
+    )
+    .execute();
+
+  return await getPayment(orderId);
 }
 
 /**
  * Forward-only status update. Returns the new row.
  */
-export function setPaymentStatus({ orderId, status, rocketgateTxnId = null }) {
+export async function setPaymentStatus({
+  orderId,
+  status,
+  rocketgateTxnId = null,
+  appendHistory = true,
+}) {
   if (!orderId || !status) throw new Error('setPaymentStatus: orderId and status are required');
+  const prev = await getPayment(orderId);
 
-  const prev = getPayment(orderId);
   if (!prev) {
     // Insert minimal row if missing
-    return createOrUpdatePayment({ orderId, status, rocketgateTxnId });
+    return await createOrUpdatePayment({ orderId, status, rocketgateTxnId, appendHistory });
   }
 
   if (!canAdvance(prev.status, status)) {
@@ -130,18 +199,34 @@ export function setPaymentStatus({ orderId, status, rocketgateTxnId = null }) {
     return prev;
   }
 
-  updateMinimal.run({
-    order_id: orderId,
-    status,
-    rocketgate_txn: rocketgateTxnId,
-    last_update: Date.now(),
-  });
+  const history = appendHistory
+    ? appendHistoryText(prev.status_history ?? null, { ts: nowIso(), status, source: 'setStatus' })
+    : (prev.status_history ?? null);
 
-  return getPayment(orderId);
+  await db
+    .updateTable('payments')
+    .set({
+      status,
+      rocketgate_txn: rocketgateTxnId ?? prev.rocketgate_txn ?? null,
+      status_history: history,
+      updated_at: sql`CURRENT_TIMESTAMP`,
+    })
+    .where('order_id', '=', String(orderId))
+    .execute();
+
+  return await getPayment(orderId);
 }
 
-export function resetPayments() {
-  delAll.run();
+// ------------------------------ Utilities ------------------------------
+
+export async function resetPayments() {
+  await db.deleteFrom('payments').execute();
 }
 
-export default { createOrUpdatePayment, getPayment, setPaymentStatus, resetPayments };
+export default {
+  createOrUpdatePayment,
+  getPayment,
+  getPaymentByPaymentId,
+  setPaymentStatus,
+  resetPayments,
+};

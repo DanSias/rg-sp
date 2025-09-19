@@ -11,3 +11,6 @@ export { createOrUpdatePayment, getPayment, setPaymentStatus, resetPayments } fr
 
 // Orders (SQLite)
 export { createOrder, getOrder, listOrders, updateOrder, resetOrders } from './orders.js';
+
+// RocketGate settings (SQLite)
+export { getRgSettings, upsertRgSettings } from './rgSettings.js';
