@@ -1,166 +1,135 @@
 // src/routes/paymentSession.js
-import crypto from 'node:crypto';
-
 import express, { Router } from 'express';
 
-import { db } from '../db/connection.js';
 import { createOrUpdatePayment } from '../db/index.js';
+import { getRgSettings } from '../db/rgSettings.js';
 import { buildHostedPageUrl } from '../utils/rocketgate.js';
+import { canonicalShopHost } from '../utils/shopHost.js';
 import { maybeVerifyShoplazzaSignature } from '../utils/shoplazzaAuth.js';
 
 const router = Router();
 
-// Helpers
-function header(req, name) {
-  return req.headers[name] || req.headers[name.toLowerCase()] || null;
-}
-function normalizedShop(req) {
-  // Prefer explicit param/body; fall back to header if Shoplazza sends one.
-  const s =
-    (req.query && req.query.shop) ||
-    (req.body && req.body.shop) ||
-    header(req, 'x-shop-domain') ||
-    header(req, 'x-shoplazza-shop') ||
-    '';
-  return String(s || '')
-    .trim()
-    .toLowerCase();
-}
-
 /**
- * This route is configured as your "Payment Session URL" in Shoplazza.
- * Shoplazza sends x-www-form-urlencoded, so add urlencoded middleware here.
- *
- * Contract:
- *  - Verify HMAC via maybeVerifyShoplazzaSignature (env-driven)
- *  - Persist a 'pending' payment row (idempotent)
- *  - Build RocketGate HostedPage URL (success/fail include correlation params)
- *  - Return { redirect_url } to Shoplazza (they'll redirect the buyer)
+ * POST /payments/session
+ * This is your "Payment Session URL" configured in Shoplazza.
+ * Body: application/x-www-form-urlencoded
  */
 router.post(
   '/session',
+  // Shoplazza posts urlencoded; req.rawBody is already captured in index.js for HMAC
   express.urlencoded({ extended: false }),
-  maybeVerifyShoplazzaSignature,
-  async (req, res) => {
+  maybeVerifyShoplazzaSignature, // honors app.locals.verifySignatures
+  async (req, res, next) => {
     try {
+      // Important: field names here are based on our earlier test payloads.
+      // If Shoplazza sends different names, mirror the real ones here.
       const {
-        // Core identifiers
-        id: paymentId, // Shoplazza payment attempt id (session id)
-        shoplazza_order_id: orderId, // Merchant order id
-        // Money
-        amount,
-        currency,
-        // Shoplazza callback endpoints (you may or may not use these directly)
-        cancel_url,
-        complete_url, // Complete Payment API endpoint (sync)
-        callback_url, // Notify Payment API endpoint (async)
-        // Misc
-        test,
+        id: paymentId, // required: Shoplazza payment attempt id
+        shoplazza_order_id: orderId, // required: merchant order id
+        amount, // required
+        currency, // required
+        cancel_url, // optional (nice to have)
+        complete_url, // required: Shoplazza “Complete Payment” endpoint (sync)
+        callback_url, // required: Shoplazza “Notify Payment” endpoint (async)
+        test, // optional
+        shop, // optional: if Shoplazza includes the shop host directly
       } = req.body || {};
 
       // Basic validation
-      const missing = [];
-      if (!paymentId) missing.push('id');
-      if (!orderId) missing.push('shoplazza_order_id');
-      if (!amount) missing.push('amount');
-      if (!currency) missing.push('currency');
-      if (!complete_url) missing.push('complete_url');
-      if (!callback_url) missing.push('callback_url');
+      if (!paymentId || !orderId || !amount || !currency || !complete_url || !callback_url) {
+        return res.status(400).json({ code: 'INVALID', message: 'Missing required fields' });
+      }
 
-      if (missing.length) {
+      // Determine which shop this session is for:
+      // 1) explicit `shop` param from payload
+      // 2) hostname of complete_url (usually https://{shop}.myshoplaza.com/openapi/...)
+      let shopHost = canonicalShopHost(shop);
+      if (!shopHost && typeof complete_url === 'string') {
+        try {
+          const host = new URL(complete_url).hostname;
+          shopHost = canonicalShopHost(host);
+        } catch {
+          // ignore URL parse error
+        }
+      }
+
+      if (!shopHost) {
         return res.status(400).json({
-          code: 'INVALID',
-          message: 'Missing required fields: ' + missing.join(', '),
+          code: 'SHOP_UNDETERMINED',
+          message: 'Unable to determine shop host from payload',
         });
       }
 
-      const shop = normalizedShop(req);
-      const idempotencyKey =
-        header(req, 'x-request-id') || header(req, 'x-idempotency-key') || null;
-
-      // Generate a per-session nonce to bind RG return/cancel to this row
-      const nonce = crypto.randomBytes(12).toString('hex');
-
-      // Persist a stub so callbacks can find the row later (idempotent upsert in your DAL)
-      try {
-        await createOrUpdatePayment({
-          shop, // store domain (if available)
-          shoplazza_payment_id: String(paymentId),
-          order_id: String(orderId),
-          amount: typeof amount === 'number' ? amount.toFixed(2) : String(amount),
-          currency: String(currency).toUpperCase(),
-          status: 'pending',
-          idempotency_key: idempotencyKey,
-          nonce,
+      // Load per-shop RocketGate settings from DB
+      const settings = await getRgSettings(shopHost);
+      if (!settings || !settings.merchantId || !settings.merchantKey) {
+        return res.status(400).json({
+          ok: false,
+          code: 'RG_SETTINGS_MISSING',
+          message:
+            `RocketGate settings not configured for ${shopHost}. ` +
+            `Please set Merchant ID/Key in the app first.`,
         });
-      } catch (e) {
-        // Non-fatal for the redirect, but log loudly
-        console.error('createOrUpdatePayment failed:', e);
       }
 
-      // Keep a copy of the raw request in webhook_logs to aid debugging
-      try {
-        await db
-          .insertInto('webhook_logs')
-          .values({
-            source: 'shoplazza',
-            topic: 'payments/create',
-            idempotency_key: idempotencyKey,
-            headers: JSON.stringify(req.headers, null, 2),
-            payload_json: JSON.stringify(req.body, null, 2),
-          })
-          .execute();
-      } catch (e) {
-        console.warn('webhook_logs insert failed:', e?.message || e);
-      }
+      // Persist a pending payment row for reconciliation later
+      // (Adjust to your payments DAL shape if needed.)
+      const normalizedAmount =
+        typeof amount === 'number' ? amount.toFixed(2) : String(amount).trim();
 
-      // Build success/fail return URLs for RG → your app (carry correlation + Shoplazza endpoints)
+      createOrUpdatePayment({
+        orderId: String(orderId),
+        paymentId: String(paymentId),
+        customerId: String(paymentId), // we use the payment attempt id as a per-attempt "customer"
+        amount: typeof amount === 'number' ? amount.toFixed(2) : String(amount),
+        currency: String(currency).toUpperCase(),
+        status: 'pending',
+      });
+
+      // Success/fail return URLs back to our app (Shoplazza continues via `complete_url`)
       const base = process.env.APP_BASE_URL || 'http://localhost:3000';
+
       const success = new URL(`${base}/callbacks/complete-payment`);
       success.searchParams.set('orderId', String(orderId));
       success.searchParams.set('status', 'success');
       success.searchParams.set('spz_payment_id', String(paymentId));
       success.searchParams.set('spz_complete', String(complete_url));
-      success.searchParams.set('spz_cancel', String(cancel_url || ''));
+      if (cancel_url) success.searchParams.set('spz_cancel', String(cancel_url));
       success.searchParams.set('spz_callback', String(callback_url));
+      success.searchParams.set('shop', shopHost);
       if (typeof test !== 'undefined') success.searchParams.set('spz_test', String(test));
-      if (shop) success.searchParams.set('shop', shop);
-      success.searchParams.set('nonce', nonce);
 
       const fail = new URL(`${base}/callbacks/complete-payment`);
       fail.searchParams.set('orderId', String(orderId));
       fail.searchParams.set('status', 'fail');
       fail.searchParams.set('spz_payment_id', String(paymentId));
       fail.searchParams.set('spz_complete', String(complete_url));
-      fail.searchParams.set('spz_cancel', String(cancel_url || ''));
+      if (cancel_url) fail.searchParams.set('spz_cancel', String(cancel_url));
       fail.searchParams.set('spz_callback', String(callback_url));
+      fail.searchParams.set('shop', shopHost);
       if (typeof test !== 'undefined') fail.searchParams.set('spz_test', String(test));
-      if (shop) fail.searchParams.set('shop', shop);
-      fail.searchParams.set('nonce', nonce);
 
-      // Build the RocketGate Hosted Page link
+      // Build RocketGate Hosted Page URL using per-shop settings
       const redirect_url = buildHostedPageUrl({
-        id: String(paymentId), // reuse Shoplazza payment attempt id as RG "customer/account" id
-        merch: process.env.ROCKETGATE_MERCHANT_ID,
-        amount: typeof amount === 'number' ? amount.toFixed(2) : String(amount),
-        hashSecret: process.env.ROCKETGATE_HASH_SECRET,
+        id: String(paymentId), // your "customer/account id" for RG (ok to reuse paymentId)
+        merch: settings.merchantId, // per-shop Merchant ID
+        amount: normalizedAmount,
+        hashSecret: settings.merchantKey, // per-shop Merchant Key (used for RG signature)
         extra: {
-          invoice: String(orderId), // merchant invoice/order ref
+          invoice: String(orderId),
           currency: String(currency).toUpperCase(),
           purchase: 'true',
+          mode: settings.mode || 'test', // if your HP supports test vs live flags
           success: success.toString(),
           fail: fail.toString(),
-          // (optionally) include additional RG-supported fields here from your HostedPage Fields.md
-          // e.g., descriptor, email, address fields, etc., once the Shoplazza payload is mapped.
+          // TODO: add billing/shipping/email when Shoplazza gives them in create-payment
         },
       });
 
-      // Per Shoplazza spec: return the URL; Shoplazza will redirect the buyer.
-      // (Do NOT 302 the browser yourself from here.)
+      // Shoplazza expects { redirect_url } and will 302 the buyer.
       return res.json({ redirect_url });
     } catch (err) {
-      console.error('payments/session error:', err);
-      return res.status(500).json({ code: 'SERVER_ERROR', message: 'Unhandled error' });
+      return next(err);
     }
   }
 );

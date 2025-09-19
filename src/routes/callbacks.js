@@ -4,8 +4,7 @@ import crypto from 'crypto';
 import { Router } from 'express';
 
 import { getPayment, setPaymentStatus, createOrUpdatePayment } from '../db/index.js';
-// Optional: if you add server-to-server confirm, you can import it:
-// import { confirmWithServerByInvoice } from '../utils/rocketgate.js';
+import { getShop } from '../db/shops.js';
 
 const router = Router();
 
@@ -58,16 +57,14 @@ function maybeVerifyRocketGateSignature(req, res, next) {
 }
 
 /**
- * Normalize RocketGate-ish fields from either query or body.
- * Supports both current flow and earlier dev payloads.
+ * Normalize buyer-return fields from query/body.
+ * Supports our current flow that includes `spz_*` params from /payments/session.
  */
 function extractReturnFields(req) {
   const q = req.query || {};
   const b = req.body || {};
 
   const orderId = b.orderId || b.invoice || q.orderId || q.invoice || null;
-
-  // We use "result" (success|fail) in our pay.js success/fail URLs.
   const resultRaw = (b.result ?? b.status ?? q.result ?? q.status)?.toString().toLowerCase() || '';
 
   const rocketgateTxnId =
@@ -79,11 +76,17 @@ function extractReturnFields(req) {
     q.transaction_id ||
     null;
 
-  return { orderId, resultRaw, rocketgateTxnId };
+  // Shoplazza integration params we appended to the Hosted Page return links:
+  const completeUrl = b.spz_complete || q.spz_complete || null;
+  const cancelUrl = b.spz_cancel || q.spz_cancel || null;
+  const callbackUrl = b.spz_callback || q.spz_callback || null;
+  const shop = b.shop || q.shop || null;
+
+  return { orderId, resultRaw, rocketgateTxnId, completeUrl, cancelUrl, callbackUrl, shop };
 }
 
 /**
- * Map buyer return result to internal forward-only state.
+ * Map buyer return result to our forward-only state.
  */
 function mapReturnResult(resultRaw) {
   if (resultRaw === 'success') return 'returned_success';
@@ -92,8 +95,7 @@ function mapReturnResult(resultRaw) {
 }
 
 /**
- * Normalize RocketGate notify fields.
- * Accepts various shapes so you can iterate without breaking.
+ * Normalize RocketGate notify fields (multiple shapes tolerated).
  */
 function extractNotifyFields(req) {
   const q = req.query || {};
@@ -124,7 +126,6 @@ function extractNotifyFields(req) {
 
 /**
  * Map RocketGate status -> internal status.
- * Adjust if RocketGate confirms a different vocabulary.
  */
 function mapNotifyStatus(statusRaw) {
   const map = {
@@ -154,17 +155,16 @@ function mapNotifyStatus(statusRaw) {
  *   - returned_success | returned_fail | returned_unknown
  *   - rocketgateTxnId (if provided)
  *
- * Notes:
- * - We support both GET (real redirect) and POST (manual/dev testing).
- * - We do *not* verify Shoplazza signatures here; this endpoint is hit by RocketGate/browsers.
+ * Additionally, if `spz_complete` and `shop` are present, we *best-effort*
+ * POST to Shoplazza's Complete Payment endpoint with the shop's Access-Token.
  */
 async function completePaymentHandler(req, res) {
-  // Minimal debug logs during integration; remove or switch to structured logger later.
-  console.log('🔔 [complete-payment] Parsed query:', req.query);
-  if (req.method !== 'GET') console.log('🔔 [complete-payment] Parsed body:', req.body);
-  if (req.rawBody) console.log('🔒 [complete-payment] Raw body length:', req.rawBody.length);
+  console.log('🔔 [complete-payment] q:', req.query);
+  if (req.method !== 'GET') console.log('🔔 [complete-payment] b:', req.body);
+  if (req.rawBody) console.log('🔒 [complete-payment] raw len:', req.rawBody.length);
 
-  const { orderId, resultRaw, rocketgateTxnId } = extractReturnFields(req);
+  const { orderId, resultRaw, rocketgateTxnId, completeUrl, cancelUrl, callbackUrl, shop } =
+    extractReturnFields(req);
 
   if (!orderId || !resultRaw) {
     return res.status(400).json({
@@ -185,18 +185,96 @@ async function completePaymentHandler(req, res) {
     });
   }
 
-  // Forward-only update; setPaymentStatus should enforce no regressions
+  // Forward-only update (setPaymentStatus should enforce no regressions)
   const state = setPaymentStatus({
     orderId,
     status: translated,
     rocketgateTxnId: rocketgateTxnId || null,
   });
 
-  // Option A (dev-friendly): return JSON
-  return res.json({ ok: true, orderId, state });
+  // Notify Shoplazza's Complete Payment endpoint
+  let completeNotified = false;
+  const version = process.env.SHOPLAZZA_API_VERSION || '2022-01';
+  const appId = process.env.SHOPLAZZA_CLIENT_ID;
 
-  // Option B (buyer UX): redirect to an order status page in your app/admin
-  // return res.redirect(`/order/${encodeURIComponent(orderId)}?status=${translated}`);
+  if (shop && appId) {
+    try {
+      // 1) Load access token for this shop
+      const shopRow = await getShop(String(shop));
+      const accessToken = shopRow?.accessToken || null;
+
+      // 2) Build endpoint and body
+      const endpoint = `https://${shop}/openapi/${version}/payments_apps/complete_callbacks`;
+
+      // We don’t always have all fields here yet; populate what we know.
+      // If you’ve stored amount/currency in your payments table, read them instead of fallbacks.
+      const bodyObj = {
+        app_id: String(appId),
+        payment_id: String(req.query.spz_payment_id || 'unknown-payment'),
+        amount: Number(state?.amount ?? 0), // TODO: read from your payments row if available
+        currency: String(state?.currency || 'USD'), // TODO: read from your payments row if available
+        transaction_no: String(state?.rocketgate_txn || 'pending'), // or the RG transactId if you have it
+        type: 'sale', // or 'authorization' if you’re doing auth/capture
+        test: !!(req.query.spz_test && String(req.query.spz_test).toLowerCase() === 'true'),
+        status: 'paying', // per docs, this call is to tell SP the user finished checkout, not final result
+        timestamp: new Date().toISOString(),
+        // extension: { ... }    // optional custom fields
+      };
+
+      const bodyJson = JSON.stringify(bodyObj);
+
+      // 3) Compute Shoplazza HMAC over the raw JSON body using your app’s client secret
+      const clientSecret = process.env.SHOPLAZZA_CLIENT_SECRET || '';
+      const hmac = crypto.createHmac('sha256', clientSecret).update(bodyJson).digest('hex');
+
+      // 4) POST with required headers
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Token': accessToken || '',
+          'Shoplazza-Shop-Domain': String(shop),
+          'Shoplazza-Hmac-Sha256': hmac,
+        },
+        body: bodyJson,
+      });
+
+      completeNotified = resp.ok;
+
+      // Attach compact debug so you can see what happened (visible in the JSON you return)
+      const dbg = {
+        endpoint,
+        status: resp.status,
+        ok: resp.ok,
+        sent: { ...bodyObj, transaction_no: bodyObj.transaction_no }, // safe summary
+      };
+      try {
+        dbg.resText = (await resp.text()).slice(0, 400);
+      } catch (err) {
+        console.warn('Error reading complete response text', err);
+      }
+      req._completeDebug = dbg;
+
+      if (!resp.ok) {
+        console.warn('Complete Payment failed:', dbg);
+      }
+    } catch (err) {
+      console.warn('Complete Payment fetch error:', err);
+      req._completeDebug = { error: String(err) };
+    }
+  }
+
+  // Dev-friendly JSON response (swap to a redirect if you prefer buyer UX)
+  return res.json({
+    ok: true,
+    orderId,
+    state,
+    completeNotified,
+    completeDebug: req._completeDebug || null,
+    callbackUrl: callbackUrl || null,
+    cancelUrl: cancelUrl || null,
+    shop: shop || null,
+  });
 }
 
 router.get('/complete-payment', completePaymentHandler);
@@ -210,8 +288,8 @@ router.post('/complete-payment', completePaymentHandler);
  * Optional signature verification controlled by env (see helper).
  */
 router.post('/notify', maybeVerifyRocketGateSignature, async (req, res) => {
-  console.log('🔔 [notify] Parsed body:', req.body);
-  if (req.rawBody) console.log('🔒 [notify] Raw body length:', req.rawBody.length);
+  console.log('🔔 [notify] body:', req.body);
+  if (req.rawBody) console.log('🔒 [notify] raw len:', req.rawBody.length);
 
   const { orderId, statusRaw, rocketgateTxnId } = extractNotifyFields(req);
   if (!orderId || !statusRaw) {
@@ -238,14 +316,6 @@ router.post('/notify', maybeVerifyRocketGateSignature, async (req, res) => {
     status: mapped,
     rocketgateTxnId: rocketgateTxnId || null,
   });
-
-  // (Optional) Belt-and-suspenders: confirm with server by invoice and reconcile if needed.
-  // try {
-  //   const confirm = await confirmWithServerByInvoice(orderId);
-  //   // compare "confirm.status" with "mapped" and reconcile/log if different
-  // } catch (e) {
-  //   req.log?.warn?.({ err: e, orderId }, 'S2S confirm failed');
-  // }
 
   return res.json({ ok: true, state: updated });
 });
