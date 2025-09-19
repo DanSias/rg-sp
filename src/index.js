@@ -66,56 +66,14 @@ app.use(morgan('tiny'));
 // Cookie parser for session middleware
 app.use(cookieParser());
 
-// Route handlers
-import adminRouter from './routes/admin.js';
-import appApiRouter from './routes/appApi.js';
-import appLaunchRouter from './routes/appLaunch.js';
-import appProxyRouter from './routes/appProxy.js';
-import authRouter from './routes/auth.js';
-import callbacksRouter from './routes/callbacks.js';
-import orderRouter from './routes/order.js';
-import payRouter from './routes/pay.js';
-import paymentSessionRouter from './routes/paymentSession.js';
+// Mount all sub-routers in a single place (routes/index.js).
+// Keeps src/index.js clean by centralizing /admin, /auth, /app-api, /pay, /payments, etc.
+// Each router stays focused, and adding new routes only requires updating routes/index.js.
+import mountRoutes from './routes/index.js';
+mountRoutes(app);
 
-app.use('/admin', adminRouter);
-app.use('/app-api', appApiRouter);
-app.use('/app-proxy', appProxyRouter);
-app.use('/auth', authRouter);
-app.use('/callbacks', callbacksRouter);
-app.use('/order', orderRouter);
-app.use('/pay', payRouter);
-app.use('/payments', paymentSessionRouter);
-
-// If launched from Shoplazza admin, bounce to /app-start (keeps URL clean)
-app.get('/', (req, res, next) => {
-  if (req.query.install_from === 'admin' && (req.query.shop || req.query.hmac)) {
-    const qs = new URLSearchParams(req.query).toString();
-    return res.redirect(302, `/app-start?${qs}`);
-  }
-  return next(); // fall through to public/index.html for install page
-});
-
-// Gate /app.html by session (NOT by HMAC on every load)
-import { readAppSession } from './utils/appSession.js';
-app.get('/app.html', (req, res, next) => {
-  const sess = readAppSession(req);
-  if (sess?.shop) return next(); // ok, let static serve app.html
-  // No session? send them through /app-start to verify HMAC and mint a session
-  const qs = new URLSearchParams(req.query).toString();
-  return res.redirect(302, `/app-start?${qs}`);
-});
-
-// Handle /app-start (this route verifies HMAC & sets the session)
-app.use('/app-start', appLaunchRouter);
-
-// Static LAST so app.html is served after the checks above
+// Static LAST (serve public files; app.html will be session-gated by routes/index.js)
 app.use(express.static(path.join(process.cwd(), 'public'), { extensions: ['html'] }));
-
-// Simple public routing
-app.use(express.static(path.join(process.cwd(), 'public'), { extensions: ['html'] }));
-
-// Simple health check endpoint
-app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 /**
  * Minimal error handler — surfaces unexpected errors and avoids silent failures.
